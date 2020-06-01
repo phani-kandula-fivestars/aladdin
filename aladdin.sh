@@ -8,9 +8,9 @@ function ctrl_trap(){ exit 1 ; }
 trap ctrl_trap INT
 
 # Set defaults on command line args
-DEV=false
+DEV=true
 INIT=false
-CLUSTER_CODE=minikube
+CLUSTER_CODE=docker-desktop
 NAMESPACE=default
 IS_TERMINAL=true
 SKIP_PROMPTS=false
@@ -86,7 +86,7 @@ function check_and_handle_init() {
         echo "$current_time" > "$last_launched_file"
     else
         "$SCRIPT_DIR"/infra_k8s_check.sh
-        enter_minikube_env
+        # enter_minikube_env
     fi
 }
 
@@ -311,6 +311,7 @@ function enter_docker_container() {
         -e "NAMESPACE=$NAMESPACE" \
         -e "MINIKUBE_IP=$(minikube ip)" \
         -e "IS_LOCAL=$IS_LOCAL" \
+        -e "DOCKER_BUILDKIT=1" \
         -e "IS_PROD=$IS_PROD" \
         -e "IS_TESTING=$IS_TESTING" \
         -e "SKIP_PROMPTS=$SKIP_PROMPTS" \
@@ -325,6 +326,7 @@ function enter_docker_container() {
         -v "$(pathnorm $ALADDIN_CONFIG_DIR):/root/aladdin-config" \
         `# Mount minikube parts` \
         -v /var/run/docker.sock:/var/run/docker.sock \
+        -v /usr/local/bin/docker:/usr/bin/docker \
         `# Specific command` \
         ${DEV_CMD:-} ${MINIKUBE_CMD:-} ${ALADDIN_PLUGIN_CMD:-} \
         "$aladdin_image" \

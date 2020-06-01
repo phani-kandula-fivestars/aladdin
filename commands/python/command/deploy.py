@@ -71,6 +71,7 @@ def deploy(
     force_helm=False,
     repo=None,
     set_override_values=None,
+    git_account=None,
 ):
     if set_override_values is None:
         set_override_values = []
@@ -80,7 +81,7 @@ def deploy(
         cr = cluster_rules(namespace=namespace)
         helm_path = "{}/{}".format(tmpdirname, project)
         hr = HelmRules(cr, project)
-        git_account = load_git_configs()["account"]
+        git_account = git_account or load_git_configs()["account"]
         repo = repo or project
         git_url = f"git@github.com:{git_account}/{repo}.git"
         git_ref = Git.extract_hash(git_ref, git_url)
