@@ -54,21 +54,10 @@ RESET_COLOR="$(tput sgr0 2>/dev/null || printf "\e[0m")"
 # Check things are installed
 ############################
 # Do not show the check again if it has already been installed
-ALREADY_INSTALLED_FILE="$HOME/.infra/installed"
+ALREADY_INSTALLED_FILE="$HOME/.aladdin/infra/installed"
 
 ALADDIN_BIN="$HOME/.aladdin/bin"
-
-
-function which_exists(){
-    for cmd in "$@" ; do
-        if which $cmd &>/dev/null ; then
-            echo "$cmd"
-            return 0
-        fi
-    done
-    return 1
-}
-
+source "$SCRIPT_DIR/shared.sh"
 
 
 hash_cmd="$(which_exists md5sum md5)"

@@ -75,6 +75,9 @@ function exec_command_or_plugin() {
 }
 
 function _replace_aws_secret() {
+    if check_ttl "aws_secret_${CLUSTER_NAME}"; then
+        return 0
+    fi
     local creds username password server
     creds=$(aws ecr get-login)
     username=$(echo $creds | cut -d ' ' -f4)
@@ -82,6 +85,17 @@ function _replace_aws_secret() {
     server=$(echo $creds | cut -d ' ' -f9)
     kubectl delete secret aws || true
     kubectl create secret docker-registry aws --docker-username="$username" --docker-password="$password" --docker-server="$server" --docker-email="can be anything"
+    # token valid for 12 hours, cache for 10 hrs https://docs.aws.amazon.com/cli/latest/reference/ecr/get-login.html
+    set_ttl "aws_secret_${CLUSTER_NAME}" 3600*10
+}
+
+function _namespace_init() {
+    if check_ttl "${CLUSTER_NAME}_${NAMESPACE}"; then
+        return 0
+    fi
+    kubectl create namespace $NAMESPACE || true
+    $PY_MAIN namespace-init --force
+    set_ttl "${CLUSTER_NAME}_${NAMESPACE}" 3600
 }
 
 function environment_init() {
@@ -91,39 +105,35 @@ function environment_init() {
 
     _handle_aws_config
 
-    # Make sure we are on local or that cluster has been created before initializing helm, creating namespaces, etc
-    if "$IS_LOCAL" || ( kops export kubecfg --name $CLUSTER_NAME > /dev/null && \
-        kops validate cluster --name $CLUSTER_NAME ) > /dev/null; then
-
-        if "$IS_LOCAL"; then
-            mkdir -p $HOME/.kube/
-            cp $HOME/.kube_local/config $HOME/.kube/config
-            # Replace e.g. /Users/ptr/.minikube with /root/.minikube in the minikube conf dir path
-            # (since that's where it will be mounted within the aladdin container)
-            sed 's|: \?.*\.minikube|: /root/.minikube| ; /: \/root\/.minikube/ s|\\|/|g' $HOME/.kube_local/config > $HOME/.kube/config
-        else
-            cp $HOME/.kube/config $HOME/.kube_local/$CLUSTER_NAME.config
-        fi
-
-        kubectl config set-context "$NAMESPACE.$CLUSTER_NAME" --cluster "$CLUSTER_NAME" --namespace="$NAMESPACE" --user "$CLUSTER_NAME"
-        kubectl config use-context "$NAMESPACE.$CLUSTER_NAME"
-
-        _handle_authentication_config
-
-        if $INIT; then
-            kubectl create namespace --cluster $CLUSTER_NAME $NAMESPACE || true
-            _initialize_helm
-            _replace_aws_secret || true
-            $PY_MAIN namespace-init --force
-        fi
+    if "$IS_LOCAL"; then
+        mkdir -p $HOME/.kube/
+        # Replace e.g. /Users/ptr/.minikube with /root/.minikube in the minikube conf dir path
+        # (since that's where it will be mounted within the aladdin container)
+        sed 's|: \?.*\.minikube|: /root/.minikube| ; /: \/root\/.minikube/ s|\\|/|g' $HOME/.kube_local/config > $HOME/.kube/config
+    elif $INIT || ! test -f "$HOME/.kube_local/$CLUSTER_NAME.config"; then
+        echo "Getting cluster config using kops"
+        kops export kubecfg --name $CLUSTER_NAME > /dev/null
+        _add_authentication_users_to_kubeconfig
+        cp $HOME/.kube/config $HOME/.kube_local/$CLUSTER_NAME.config
+    else
+        echo "Using cached cluster config"
+        mkdir -p $HOME/.kube/
+        cp $HOME/.kube_local/$CLUSTER_NAME.config $HOME/.kube/config
     fi
-
+    _handle_authentication_config
+    kubectl config use-context "$NAMESPACE.$CLUSTER_NAME"
+    # Make sure we are on local or that cluster has been created before initializing helm, creating namespaces, etc
+    if "$IS_LOCAL" || ! $SKIP_INIT; then
+        "$INIT" && _initialize_helm
+        _replace_aws_secret || true
+        _namespace_init
+    fi
     echo "END ENVIRONMENT CONFIGURATION==============================================="
 
 }
 
 function _initialize_helm() {
-    local rbac_enabled="$(_extract_cluster_config_value rbac_enabled)"
+    local rbac_enabled="$(_extract_cluster_config_value rbac_enabled false)"
     if $rbac_enabled; then
         kubectl -n kube-system create serviceaccount tiller || true
         kubectl create clusterrolebinding tiller --clusterrole cluster-admin --serviceaccount=kube-system:tiller || true
@@ -134,22 +144,30 @@ function _initialize_helm() {
 }
 
 function _handle_authentication_config() {
-    # This function adds appropriate users to kubeconfig, and exports necessary AUTHENTICATION variables
+    # This function exports necessary AUTHENTICATION variables
+    # This function does not add the authentication users to `.kube/config`, use `_add_authentication_users_to_kubeconfig` for that
     # export AUTHENTICATION_ENABLED for change-permissions and bash command
-    export AUTHENTICATION_ENABLED="$(_extract_cluster_config_value authentication_enabled)"
+    export AUTHENTICATION_ENABLED="$(_extract_cluster_config_value authentication_enabled false)"
     if $AUTHENTICATION_ENABLED; then
-        AUTHENTICATION_ROLES="$(_extract_cluster_config_value authentication_roles)"
-        AUTHENTICATION_ALADDIN_ROLE="$(_extract_cluster_config_value authentication_aladdin_role)"
+        # export AUTHENTICATION_ALADDIN_ROLE for change_to_aladdin_permission helper command
+        export AUTHENTICATION_ALADDIN_ROLE="$(_extract_cluster_config_value authentication_aladdin_role)"
         # export AUTHENTICATION_DEFAULT_ROLE for bash command
         export AUTHENTICATION_DEFAULT_ROLE="$(_extract_cluster_config_value authentication_default_role)"
         # export AUTHENTICATION_ALLOWED_CHANGE_ROLES for change-permissions command
         export AUTHENTICATION_ALLOWED_CHANGE_ROLES="$(_extract_cluster_config_value authentication_allowed_change_roles)"
-        jq -r '.|keys[]' <<< "$AUTHENTICATION_ROLES" | while read name ; do
-            role_arn="$(jq -r --arg name "$name" '.[$name]' <<< $AUTHENTICATION_ROLES)"
-            _add_authentication_user_to_kubeconfig "$name" "$role_arn"
-        done
-        kubectl config set-context "$NAMESPACE.$CLUSTER_NAME" --cluster "$CLUSTER_NAME" --namespace="$NAMESPACE" --user "$AUTHENTICATION_ALADDIN_ROLE"
+        kubectl config set-context "$NAMESPACE.$CLUSTER_NAME" --cluster "$CLUSTER_NAME" --namespace="$NAMESPACE" --user "$AUTHENTICATION_ALADDIN_ROLE" > /dev/null
+    else
+        kubectl config set-context "$NAMESPACE.$CLUSTER_NAME" --cluster "$CLUSTER_NAME" --namespace="$NAMESPACE" --user "$CLUSTER_NAME" > /dev/null
     fi
+}
+
+function _add_authentication_users_to_kubeconfig() {
+    local role_arn
+    local roles="$(_extract_cluster_config_value authentication_roles [])"
+    jq -r '.|keys[]' <<< "$roles" | while read name ; do
+        role_arn="$(jq -r --arg name "$name" '.[$name]' <<< $roles)"
+        _add_authentication_user_to_kubeconfig "$name" "$role_arn"
+    done
 }
 
 function _add_authentication_user_to_kubeconfig() {
@@ -186,7 +204,7 @@ function _handle_aws_config() {
     # Move aws credentials away from mount so we don't edit the host's aws files
     cp -r /root/tmp/.aws /root/.aws
     # See if bastion account is enabled
-    export BASTION_ACCOUNT_ENABLED="$(_extract_cluster_config_value bastion_account_enabled)"
+    export BASTION_ACCOUNT_ENABLED="$(_extract_cluster_config_value bastion_account_enabled false)"
     if "$BASTION_ACCOUNT_ENABLED"; then
         # Export BASTION_ACCOUNT_PROFILE, needed by add-aws-assume-role-config command
         export BASTION_ACCOUNT_PROFILE="$(_extract_cluster_config_value bastion_account_profile)"
@@ -205,19 +223,27 @@ function _handle_aws_config() {
         publish_profile="$(jq -r '.aws_profile' <<< $publish_config)"
         publish_role="$(jq -r '.aws_role_to_assume' <<< $publish_config)"
         publish_mfa_enabled="$(jq -r '.aws_role_mfa_required' <<< $publish_config)"
-        "$add_assume_role_config" "$publish_role" "$publish_profile" "$publish_mfa_enabled" 3600 # 1 hour
         # Need to add aws configuration for current cluster's aws account
-        aws_profile="$(_extract_cluster_config_value bastion_account_profile_to_assume)"
-        aws_role="$(_extract_cluster_config_value bastion_account_role_to_assume)"
-        aws_mfa_enabled="$(_extract_cluster_config_value bastion_account_mfa_enabled)"
-        "$add_assume_role_config" "$aws_role" "$aws_profile" "$aws_mfa_enabled" 3600 # 1 hour
+        bastion_profile="$(_extract_cluster_config_value bastion_account_profile_to_assume)"
+        bastion_role="$(_extract_cluster_config_value bastion_account_role_to_assume)"
+        bastion_mfa_enabled="$(_extract_cluster_config_value bastion_account_mfa_enabled false)"
+        # if the roles are the same then there's no need to get credentials for both
+        if [[ $bastion_role != $publish_role ]]; then
+            if [[ $bastion_profile == $publish_profile ]]; then
+                # the user has set different aws roles for their cluster/publish configs
+                # but using the same profile name for both, continuing would override the publish credentials
+                >&2 echo "Bastion account misconfigured!"
+                >&2 echo "Cluster role and Publish role are different, but their profile is the same"
+                return 1
+            fi
+            "$add_assume_role_config" "$publish_role" "$publish_profile" "$publish_mfa_enabled" 3600 # 1 hour
+        fi
+        "$add_assume_role_config" "$bastion_role" "$bastion_profile" "$bastion_mfa_enabled" 3600 # 1 hour
         # We reset AWS_DEFAULT_PROFILE here because that entry will be present in aws config files now
         export AWS_DEFAULT_PROFILE="$aws_default_profile_temp"
-    else
+    elif "$INIT" && ! "$IS_LOCAL"; then
         # Test aws config for current cluster's aws account if INIT and not IS_LOCAL
-        if "$INIT" && ! "$IS_LOCAL"; then
-            _test_aws_config "$AWS_DEFAULT_PROFILE"
-        fi
+        _test_aws_config "$AWS_DEFAULT_PROFILE"
     fi
     # Kops uses AWS_PROFILE instead of AWS_DEFAULT_PROFILE
     export AWS_PROFILE="$AWS_DEFAULT_PROFILE"
